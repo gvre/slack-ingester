@@ -77,14 +77,18 @@ class TestGetChannelInfo:
                 await client.get_channel_info("C001")
 
     async def test_maps_ratelimited(self, client):
-        with patch.object(
-            client._http,
-            "get",
-            new=AsyncMock(return_value=make_rate_limit_response(retry_after=30)),
+        with (
+            patch.object(
+                client._http,
+                "get",
+                new=AsyncMock(return_value=make_rate_limit_response(retry_after=30)),
+            ),
+            patch("slack_ingester.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
         ):
             with pytest.raises(SlackRateLimitError) as exc_info:
                 await client.get_channel_info("C001")
             assert exc_info.value.retry_after == 30
+            assert mock_sleep.await_count == 4
 
     async def test_maps_unknown_error(self, client):
         with patch.object(
@@ -186,6 +190,49 @@ class TestGetChannelHistoryWithParams:
 
         call_params = mock_get.call_args.kwargs["params"]
         assert call_params["cursor"] == "cursor123"
+
+
+class TestRetryOnRateLimit:
+    async def test_retries_then_succeeds(self, client):
+        ok_response = make_response({"ok": True, "channel": {"id": "C001", "name": "general"}})
+        mock_get = AsyncMock(side_effect=[make_rate_limit_response(retry_after=5), ok_response])
+        with (
+            patch.object(client._http, "get", new=mock_get),
+            patch("slack_ingester.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            info = await client.get_channel_info("C001")
+        assert info["name"] == "general"
+        assert mock_get.await_count == 2
+        mock_sleep.assert_awaited_once_with(5)
+
+    async def test_exhausts_retries_and_raises(self, client):
+        mock_get = AsyncMock(return_value=make_rate_limit_response(retry_after=1))
+        with (
+            patch.object(client._http, "get", new=mock_get),
+            patch("slack_ingester.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            with pytest.raises(SlackRateLimitError):
+                await client.get_channel_info("C001")
+        assert mock_get.await_count == 5
+        assert mock_sleep.await_count == 4
+
+    async def test_sleep_duration_matches_retry_after(self, client):
+        ok_response = make_response({"ok": True, "channel": {"id": "C001", "name": "general"}})
+        mock_get = AsyncMock(
+            side_effect=[
+                make_rate_limit_response(retry_after=10),
+                make_rate_limit_response(retry_after=20),
+                ok_response,
+            ]
+        )
+        with (
+            patch.object(client._http, "get", new=mock_get),
+            patch("slack_ingester.client.asyncio.sleep", new_callable=AsyncMock) as mock_sleep,
+        ):
+            await client.get_channel_info("C001")
+        assert mock_sleep.await_count == 2
+        mock_sleep.assert_any_await(10)
+        mock_sleep.assert_any_await(20)
 
 
 class TestGetThreadMessages:

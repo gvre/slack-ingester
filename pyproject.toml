@@ -1,6 +1,6 @@
 [project]
 name = "slack-ingester"
-version = "0.0.2"
+version = "0.1.0"
 description = "Async library to ingest and parse Slack channel messages"
 readme = "README.md"
 license = "MIT"

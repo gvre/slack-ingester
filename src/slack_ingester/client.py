@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from typing import Any, Self
 
 import httpx
@@ -16,7 +18,7 @@ _CHANNEL_ERRORS = {"channel_not_found", "not_in_channel", "missing_scope"}
 
 def _raise_for_slack_response(response: httpx.Response) -> dict[str, Any]:
     if response.status_code == 429:
-        retry_after = int(response.headers.get("Retry-After", 1))
+        retry_after = int(response.headers.get("Retry-After", 30))
         raise SlackRateLimitError("Rate limited by Slack API", retry_after=retry_after)
     try:
         data: dict[str, Any] = response.json()
@@ -32,6 +34,11 @@ def _raise_for_slack_response(response: httpx.Response) -> dict[str, Any]:
     if code in _CHANNEL_ERRORS:
         raise SlackChannelNotFoundError(f"Channel not found or inaccessible: {code}")
     raise SlackIngesterError(f"Slack API error: {code}")
+
+
+_log = logging.getLogger(__name__)
+
+_MAX_RETRIES = 5
 
 
 class SlackClient:
@@ -51,9 +58,23 @@ class SlackClient:
     async def __aexit__(self, *_: object) -> None:
         await self.aclose()
 
+    async def _get(self, path: str, *, params: dict[str, Any]) -> dict[str, Any]:
+        for attempt in range(1, _MAX_RETRIES + 1):
+            response = await self._http.get(path, params=params)
+            try:
+                return _raise_for_slack_response(response)
+            except SlackRateLimitError as exc:
+                if attempt == _MAX_RETRIES:
+                    raise
+                _log.warning(
+                    "Rate limited by Slack, retrying in %ds (attempt %d/%d)",
+                    exc.retry_after, attempt, _MAX_RETRIES,
+                )
+                await asyncio.sleep(exc.retry_after)
+        raise AssertionError("unreachable")
+
     async def get_channel_info(self, channel_id: str) -> dict[str, Any]:
-        response = await self._http.get("/conversations.info", params={"channel": channel_id})
-        data = _raise_for_slack_response(response)
+        data = await self._get("/conversations.info", params={"channel": channel_id})
         return dict(data["channel"])
 
     async def get_channel_history(
@@ -72,8 +93,7 @@ class SlackClient:
             params["latest"] = latest
         if cursor is not None:
             params["cursor"] = cursor
-        response = await self._http.get("/conversations.history", params=params)
-        data = _raise_for_slack_response(response)
+        data = await self._get("/conversations.history", params=params)
         messages: list[dict[str, Any]] = data["messages"]
         next_cursor: str | None = data.get("response_metadata", {}).get("next_cursor") or None
         return messages, next_cursor
@@ -94,8 +114,7 @@ class SlackClient:
             }
             if cursor is not None:
                 params["cursor"] = cursor
-            response = await self._http.get("/conversations.replies", params=params)
-            data = _raise_for_slack_response(response)
+            data = await self._get("/conversations.replies", params=params)
             batch: list[dict[str, Any]] = data["messages"]
             # Slack includes the parent in every page; keep it only from the first.
             messages.extend(batch if not messages else batch[1:])
